@@ -762,11 +762,13 @@ class TablesGenerator(CodeGenerator):
 
 
 class DeclarativeGenerator(TablesGenerator):
+    # PATCH 1: Added "use_str_enums" to valid_options
     valid_options: ClassVar[set[str]] = TablesGenerator.valid_options | {
         "use_inflect",
         "nojoined",
         "nobidi",
         "noidsuffix",
+        "use_str_enums",
     }
 
     def __init__(
@@ -781,6 +783,10 @@ class DeclarativeGenerator(TablesGenerator):
         super().__init__(metadata, bind, options, indentation=indentation)
         self.base_class_name: str = base_class_name
         self.inflect_engine = inflect.engine()
+        # PATCH 2: Added str_enums dictionary
+        self.str_enums: dict[
+            str, tuple[str, list[str]]
+        ] = {}  # {signature: (class_name, values)}
 
     def generate_base(self) -> None:
         self.base = Base(
@@ -792,17 +798,138 @@ class DeclarativeGenerator(TablesGenerator):
             metadata_ref=f"{self.base_class_name}.metadata",
         )
 
+    # PATCH 3: Added 5 new helper methods for StrEnum feature
+    def _get_enum_signature(self, enum_values: list[str]) -> str:
+        """Generate a unique signature for an enum based on its values."""
+        return "|".join(sorted(enum_values))
+
+    def _generate_str_enum_name(
+        self, table_name: str, column_name: str, existing_names: set[str]
+    ) -> str:
+        """Generate a unique name for a StrEnum class."""
+        # Convert column name to PascalCase
+        column_part = "".join(
+            part[:1].upper() + part[1:] for part in column_name.split("_")
+        )
+
+        # If table_name is empty, use just the column name (for shared enums)
+        if not table_name:
+            preferred_name = column_part
+            return self.find_free_name(preferred_name, existing_names)
+
+        # Otherwise, use TableColumn format
+        table_part = "".join(
+            part[:1].upper() + part[1:] for part in table_name.split("_")
+        )
+        preferred_name = table_part + column_part
+        return self.find_free_name(preferred_name, existing_names)
+
+    def _extract_enum_info(self) -> None:
+        """Extract enum information from all tables and build str_enums mapping."""
+        if "use_str_enums" not in self.options:
+            return
+
+        existing_names: set[str] = set()
+        # Track which enum signatures map to which table/column (for naming)
+        # Also track the original enum values (in order)
+        signature_info: dict[
+            str, tuple[list[str], list[tuple[str, str]]]
+        ] = {}  # {signature: (enum_values, [(table, column), ...])}
+
+        for table in self.metadata.sorted_tables:
+            for column in table.columns:
+                if isinstance(column.type, Enum):
+                    enum_values = list(column.type.enums)
+                    signature = self._get_enum_signature(enum_values)
+
+                    if signature not in signature_info:
+                        # Store the enum values in their original order
+                        signature_info[signature] = (enum_values, [])
+                    signature_info[signature][1].append((table.name, column.name))
+
+        # Now generate names for each unique enum
+        for signature, (enum_values, sources) in signature_info.items():
+            # Get the first source for naming
+            table_name, column_name = sources[0]
+
+            # If multiple tables use the same enum, try to use just the column name
+            # Otherwise, use TableColumn format
+            if len(sources) > 1:
+                # Multiple tables share this enum - try column name only
+                enum_name = self._generate_str_enum_name(
+                    "", column_name, existing_names
+                )
+            else:
+                # Single table - always use TableColumn format
+                enum_name = self._generate_str_enum_name(
+                    table_name, column_name, existing_names
+                )
+
+            existing_names.add(enum_name)
+
+            # Use the original enum values (not sorted for rendering)
+            self.str_enums[signature] = (enum_name, enum_values)
+
+    def _render_str_enum_class(self, class_name: str, values: list[str]) -> str:
+        """Render a single StrEnum class definition."""
+        lines = [f"class {class_name}(StrEnum):"]
+        for value in values:
+            # Convert value to valid Python identifier for enum member name
+            member_name = value.upper().replace("-", "_").replace(" ", "_")
+            # Remove any characters that aren't valid in identifiers
+            member_name = "".join(
+                c if c.isalnum() or c == "_" else "_" for c in member_name
+            )
+            if member_name[0].isdigit():
+                member_name = "_" + member_name
+            lines.append(f"    {member_name} = {value!r}")
+        return "\n".join(lines)
+
+    def _render_str_enums(self) -> str:
+        """Render all StrEnum class definitions."""
+        if not self.str_enums:
+            return ""
+
+        rendered = []
+        for _, (class_name, values) in sorted(
+            self.str_enums.items(), key=lambda x: x[1][0]
+        ):
+            rendered.append(self._render_str_enum_class(class_name, values))
+
+        return "\n\n\n".join(rendered)
+
+    # PATCH 4: Modified collect_imports to add StrEnum import
     def collect_imports(self, models: Iterable[Model]) -> None:
         super().collect_imports(models)
         if any(isinstance(model, ModelClass) for model in models):
             self.add_literal_import("sqlalchemy.orm", "Mapped")
             self.add_literal_import("sqlalchemy.orm", "mapped_column")
 
+            # Add StrEnum import if we have enums and the flag is set
+            if "use_str_enums" in self.options and self.str_enums:
+                self.add_literal_import("enum", "StrEnum")
+
     def collect_imports_for_model(self, model: Model) -> None:
         super().collect_imports_for_model(model)
         if isinstance(model, ModelClass):
             if model.relationships:
                 self.add_literal_import("sqlalchemy.orm", "relationship")
+
+    # PATCH 9: Override collect_imports_for_column to skip Enum import for str_enums
+    def collect_imports_for_column(self, column: Column[Any]) -> None:
+        # Check if this is an Enum type that we're converting to str_enum
+        if "use_str_enums" in self.options and isinstance(column.type, Enum):
+            enum_values = list(column.type.enums)
+            signature = self._get_enum_signature(enum_values)
+            if signature in self.str_enums:
+                # Don't add Enum import, we're using String instead
+                # But still handle special cases like ARRAY, JSON, etc.
+                if isinstance(column.type, ARRAY):
+                    self.add_import(column.type.item_type.__class__)
+                return
+
+        # Otherwise, use the parent implementation
+        super().collect_imports_for_column(column)
 
     def generate_models(self) -> list[Model]:
         models_by_table_name: dict[str, Model] = {}
@@ -867,6 +994,9 @@ class DeclarativeGenerator(TablesGenerator):
             isinstance(model, ModelClass) for model in models_by_table_name.values()
         ):
             super().generate_base()
+
+        # PATCH 5: Extract enum information before collecting imports
+        self._extract_enum_info()
 
         # Collect the imports
         self.collect_imports(models_by_table_name.values())
@@ -1130,8 +1260,16 @@ class DeclarativeGenerator(TablesGenerator):
             preferred_name, global_names, local_names
         )
 
+    # PATCH 6: Modified render_models to include StrEnum definitions
     def render_models(self, models: list[Model]) -> str:
         rendered: list[str] = []
+
+        # Render StrEnum definitions first
+        str_enums_code = self._render_str_enums()
+        if str_enums_code:
+            rendered.append(str_enums_code)
+
+        # Render models
         for model in models:
             if isinstance(model, ModelClass):
                 rendered.append(self.render_class(model))
@@ -1235,6 +1373,7 @@ class DeclarativeGenerator(TablesGenerator):
         else:
             return ""
 
+    # PATCH 7: Modified render_column_python_type to use StrEnum
     def render_column_python_type(self, column: Column[Any]) -> str:
         def get_type_qualifiers() -> tuple[str, TypeEngine[Any], str]:
             column_type = column.type
@@ -1255,6 +1394,13 @@ class DeclarativeGenerator(TablesGenerator):
             return "".join(pre), column_type, "]" * post_size
 
         def render_python_type(column_type: TypeEngine[Any]) -> str:
+            # Check if this is an Enum type and we're using str_enums
+            if "use_str_enums" in self.options and isinstance(column_type, Enum):
+                enum_values = list(column_type.enums)
+                signature = self._get_enum_signature(enum_values)
+                if signature in self.str_enums:
+                    return self.str_enums[signature][0]
+
             if isinstance(column_type, DOMAIN):
                 column_type = column_type.data_type
 
@@ -1275,6 +1421,44 @@ class DeclarativeGenerator(TablesGenerator):
         pre, col_type, post = get_type_qualifiers()
         column_python_type = f"{pre}{render_python_type(col_type)}{post}"
         return column_python_type
+
+    # PATCH 8: Override render_column to skip nullable=False for str_enum columns
+    def render_column(
+        self, column: Column[Any], show_name: bool, is_table: bool = False
+    ) -> str:
+        # Call parent to get the rendered column
+        rendered = super().render_column(column, show_name, is_table)
+
+        # For str_enum columns specifically, nullable is expressed through Optional[]
+        # in the type annotation, so we don't need nullable=False in mapped_column()
+        if (
+            not is_table
+            and not column.nullable
+            and not column.primary_key
+            and "use_str_enums" in self.options
+            and isinstance(column.type, Enum)
+        ):
+            enum_values = list(column.type.enums)
+            signature = self._get_enum_signature(enum_values)
+            if signature in self.str_enums:
+                # Remove the redundant nullable=False parameter for str_enum columns
+                rendered = rendered.replace(", nullable=False)", ")")
+
+        return rendered
+
+    # PATCH 10: Override render_column_type to use String for str_enum columns
+    def render_column_type(self, coltype: TypeEngine[Any]) -> str:
+        # If this is an Enum type and we're using str_enums, render it as String
+        if "use_str_enums" in self.options and isinstance(coltype, Enum):
+            enum_values = list(coltype.enums)
+            signature = self._get_enum_signature(enum_values)
+            if signature in self.str_enums:
+                # Return String instead of Enum(...) for str_enum columns
+                self.add_import(String)
+                return "String"
+
+        # Otherwise, use the parent implementation
+        return super().render_column_type(coltype)
 
     def render_column_attribute(self, column_attr: ColumnAttribute) -> str:
         column = column_attr.column
